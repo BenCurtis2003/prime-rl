@@ -9,6 +9,8 @@ from torch.distributed.tensor import DTensor, Shard
 from torch.distributed.tensor.placement_types import _StridedShard
 from torch.optim import Optimizer
 
+from prime_rl.trainer.optim.base import UpdateHook
+
 
 def newton_schulz(G: Tensor, coefficients: tuple[tuple[float, float, float], ...], eps: float = 1e-8) -> Tensor:
     """Approximately orthogonalize the last two dims of ``G`` in bfloat16; leading dims are a batch."""
@@ -95,6 +97,8 @@ class Muon(Optimizer):
         self.update_rms = update_rms
         self.max_in_flight = max_in_flight
         self._row_scales: dict[Tensor, Tensor] = {}
+        # Called around each chunk's parameter update (``ChunkedUpdates.update_hook``)
+        self.update_hook: UpdateHook | None = None
 
     def chunks(self) -> list[Chunk]:
         """Every parameter with a gradient, exactly once, in a fixed order that is the same on every rank."""
@@ -149,7 +153,10 @@ class Muon(Optimizer):
         shard_dim, _, size, rank = shard_group(params[0])
         scale = self._update_scale(params[0], shard_dim, size, rank)
         decay = torch.tensor(1 - group["lr"] * group["weight_decay"])
+        finish = self.update_hook(params) if self.update_hook is not None else None
         _apply_update(X, O, decay, scale * group["lr"])
+        if finish is not None:
+            finish()
 
     def orthogonalize_chunk(
         self, params: list[Tensor], U: list[Tensor], first_owner: int = 0
@@ -214,8 +221,11 @@ class Muon(Optimizer):
         denom = torch._foreach_sqrt(V)
         torch._foreach_div_(denom, math.sqrt(1 - beta2**step))
         torch._foreach_add_(denom, group["epsilon"])
+        finish = self.update_hook(chunk.params) if self.update_hook is not None else None
         torch._foreach_mul_(X, 1 - group["lr"] * group["weight_decay"])
         torch._foreach_addcdiv_(X, M, denom, value=-group["lr"] / (1 - beta1**step))
+        if finish is not None:
+            finish()
 
     def _state(self, param: Tensor, key: str) -> Tensor:
         state = self.state[param]
